@@ -1,0 +1,18 @@
+node_modules/
+# Secrets + generated config — NEVER commit (Discord bot token + AI key live here)
+discord.config.json
+# Installer-generated launchers
+start.bat
+start.sh
+start.command
+# Runtime state (tunnel URL, SQLite game bookkeeping, headless browser profile)
+data/
+*.sqlite
+*.sqlite-*
+profile/
+# cloudflared binary + logs (downloaded by the installer)
+cloudflared
+cloudflared.exe
+cloudflared.tgz
+cloudflared.log
+*.log

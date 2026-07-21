@@ -1,0 +1,19 @@
+{
+  "name": "open-historia-discord",
+  "version": "1.0.0",
+  "description": "Self-hosted Discord edition of Open Historia: players vote, the bot drives a headless game, spectators watch a read-only live map.",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "start": "node run.mjs",
+    "register": "node bot.mjs --register-only",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "playwright": "^1.49.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
