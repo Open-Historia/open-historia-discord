@@ -2,9 +2,12 @@
 // discord.js client that turns a server's votes into moves in a headless game and
 // posts the results (events + a live map PNG) back to Discord. The bot's own
 // bridge is the ONLY writer; players interact only through Discord + a read-only
-// live map. M2 scope: single shared nation, one action ballot per round, timed
-// voting with an all-ready / host-close override. Multi-nation factions,
-// diplomacy replies, catalysts and unit orders layer on in M4.
+// live map.
+//
+// Single nation  -> everything happens in the channel /startgame was run in.
+// Multiple nations -> each faction gets a role + private war-room; players propose
+// and vote there, and ONE jump resolves every faction's winning orders together
+// (per-nation attribution is enforced by the game engine, workstream B).
 import {
   Client,
   GatewayIntentBits,
@@ -16,6 +19,7 @@ import {
   ButtonBuilder,
   ButtonStyle,
   AttachmentBuilder,
+  PermissionFlagsBits,
 } from "discord.js";
 import { readFileSync } from "node:fs";
 import path from "node:path";
@@ -25,6 +29,7 @@ import { oh, waitForBridge } from "./bridge-client.mjs";
 import { ballotId as makeBallotId } from "./ids.mjs";
 import * as store from "./persistence.mjs";
 import { resolveRound } from "./rounds.mjs";
+import { provisionFactions, assignNation, nationForChannel } from "./factions.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_URL_FILE = path.join(__dirname, "data", "public-url.txt");
@@ -36,17 +41,35 @@ const guildId = CONFIG.discord?.guildId;
 
 // --- slash commands ----------------------------------------------------------
 const commands = [
-  new SlashCommandBuilder().setName("startgame").setDescription("Host: start a new game in this channel")
-    .addStringOption((o) => o.setName("nation").setDescription("The nation everyone plays (e.g. France)").setRequired(true)),
-  new SlashCommandBuilder().setName("propose").setDescription("Propose an action for this round")
-    .addStringOption((o) => o.setName("text").setDescription("What should our nation do?").setRequired(true)),
+  new SlashCommandBuilder().setName("startgame").setDescription("Host: start a game")
+    .addStringOption((o) => o.setName("nations").setDescription("Comma-separated nations (one = solo, many = teams)").setRequired(true)),
+  new SlashCommandBuilder().setName("join").setDescription("Join a nation's team")
+    .addStringOption((o) => o.setName("nation").setDescription("Which nation to play").setRequired(true)),
+  new SlashCommandBuilder().setName("leave").setDescription("Leave your current nation"),
+  new SlashCommandBuilder().setName("propose").setDescription("Propose an action for your nation this round")
+    .addStringOption((o) => o.setName("text").setDescription("What should your nation do?").setRequired(true)),
+  new SlashCommandBuilder().setName("forces").setDescription("Propose a military order (deploy / move / attack)")
+    .addStringOption((o) => o.setName("order").setDescription("deploy | move | attack").setRequired(true)
+      .addChoices({ name: "deploy", value: "deploy" }, { name: "move", value: "move" }, { name: "attack", value: "attack" }))
+    .addStringOption((o) => o.setName("detail").setDescription("e.g. '2 infantry to the Rhineland'").setRequired(true)),
+  new SlashCommandBuilder().setName("diplomacy").setDescription("Diplomacy: open / reply / list")
+    .addStringOption((o) => o.setName("action").setDescription("open | reply | list").setRequired(true)
+      .addChoices({ name: "open", value: "open" }, { name: "reply", value: "reply" }, { name: "list", value: "list" }))
+    .addStringOption((o) => o.setName("target").setDescription("Chat id (reply) or nation (open)"))
+    .addStringOption((o) => o.setName("message").setDescription("Message text (open / reply)")),
   new SlashCommandBuilder().setName("openvote").setDescription("Host: close proposals and open voting"),
   new SlashCommandBuilder().setName("closevote").setDescription("Host: close voting now and resolve the round"),
   new SlashCommandBuilder().setName("ready").setDescription("Mark yourself ready — voting ends when everyone is"),
-  new SlashCommandBuilder().setName("map").setDescription("Post the current world map"),
+  new SlashCommandBuilder().setName("catalyst").setDescription("Host: put the active catalyst to a vote"),
+  new SlashCommandBuilder().setName("inspect").setDescription("Inspect a region's owner")
+    .addStringOption((o) => o.setName("region").setDescription("Region name").setRequired(true)),
+  new SlashCommandBuilder().setName("country").setDescription("A country's stat sheet")
+    .addStringOption((o) => o.setName("name").setDescription("Country name").setRequired(true)),
+  new SlashCommandBuilder().setName("map").setDescription("Post the current world map")
+    .addStringOption((o) => o.setName("focus").setDescription("Region or country to center on")),
   new SlashCommandBuilder().setName("live").setDescription("Get the read-only live map link"),
   new SlashCommandBuilder().setName("status").setDescription("Show the current game status"),
-  new SlashCommandBuilder().setName("help").setDescription("How to play the Open Historia Discord game"),
+  new SlashCommandBuilder().setName("help").setDescription("How to play"),
   new SlashCommandBuilder().setName("endgame").setDescription("Host: end the current game"),
 ];
 
@@ -56,7 +79,7 @@ async function registerCommands() {
   console.log(`Registered ${commands.length} guild slash commands.`);
 }
 
-// --- live URL ----------------------------------------------------------------
+// --- helpers -----------------------------------------------------------------
 function liveUrl() {
   try {
     const u = readFileSync(PUBLIC_URL_FILE, "utf8").trim();
@@ -66,39 +89,103 @@ function liveUrl() {
   }
 }
 
+const isMulti = (game) => (game.factions || []).length > 0;
+const isHost = (interaction) => interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild) ?? false;
+
 if (REGISTER_ONLY) {
   await registerCommands();
   process.exit(0);
 }
 
-// --- discord client ----------------------------------------------------------
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-const timers = new Map(); // guildId -> timeout
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
+const timers = new Map(); // guildId -> voting timeout
 
 function embed(title, description, color = 0x6d5aed) {
   return new EmbedBuilder().setTitle(title).setDescription(String(description || "").slice(0, 4000)).setColor(color);
 }
 
-async function channelFor(game) {
-  if (!game.channelId) return null;
+const fetchChannel = async (id) => { try { return id ? await client.channels.fetch(id) : null; } catch { return null; } };
+
+// The channel a faction proposes/votes in: its war-room, or (solo) the game channel.
+const nationChannelId = (game, nation) =>
+  isMulti(game) ? game.factions.find((f) => f.nation === nation)?.channelId : game.channelId;
+
+// Where round-wide summaries go: #oh-world (multi) or the single channel (solo).
+const feedChannelId = (game) => (isMulti(game) ? game.worldChannelId : game.channelId);
+
+async function send(channelId, payload) {
+  const ch = await fetchChannel(channelId);
+  if (ch) return ch.send(payload).catch(() => null);
+  return null;
+}
+
+async function postMap(game, focus, channelId) {
   try {
-    return await client.channels.fetch(game.channelId);
-  } catch {
-    return null;
+    const opts = focus ? { region: focus, zoom: 4 } : { country: game.primaryNation, zoom: 4 };
+    const { png } = await oh("screenshotMap", opts);
+    const file = new AttachmentBuilder(Buffer.from(png, "base64"), { name: "map.png" });
+    await send(channelId || feedChannelId(game), { files: [file] });
+  } catch (e) {
+    await send(channelId || feedChannelId(game), `(map unavailable: ${e.message})`);
   }
 }
 
-// Post the current map (best-effort) to the game channel.
-async function postMap(game, caption) {
-  const ch = await channelFor(game);
-  if (!ch) return;
-  try {
-    const { png } = await oh("screenshotMap", { country: game.primaryNation, zoom: 4 });
-    const file = new AttachmentBuilder(Buffer.from(png, "base64"), { name: "map.png" });
-    await ch.send({ content: caption || undefined, files: [file] });
-  } catch (e) {
-    await ch.send(`(map unavailable: ${e.message})`);
+// --- round lifecycle ---------------------------------------------------------
+async function startCollecting(guildId) {
+  const game = store.updateGame(guildId, (g) => { g.phase = "COLLECTING"; g.phaseEndsAt = 0; g.ballots = {}; g.votes = {}; });
+  const round = game.round + 1;
+  if (isMulti(game)) {
+    for (const f of game.factions) {
+      await send(f.channelId, embed(`🗳️ Round ${round} — ${f.nation}`, `Propose **${f.nation}**'s moves with \`/propose\` (or \`/forces\` for military orders). The host runs \`/openvote\` when ready.`, 0x6d5aed));
+    }
+    await send(game.worldChannelId, embed(`🗳️ Round ${round} — proposals open`, "Each nation is planning in its war-room.", 0x6d5aed));
+  } else {
+    await send(game.channelId, embed(`🗳️ Round ${round} — propose your moves`, `Use \`/propose\` (or \`/forces\`), then the host runs \`/openvote\`.`, 0x6d5aed));
   }
+}
+
+// Add a proposal to the acting nation's action ballot.
+function addProposal(guildId, nation, text, label) {
+  const game = store.getGame(guildId);
+  const bId = makeBallotId({ round: game.round, nation, decisionKey: "action" });
+  store.updateGame(guildId, (g) => {
+    if (!g.ballots[bId]) g.ballots[bId] = { id: bId, kind: "action", decisionKey: "action", nation, options: [] };
+    const optId = `${bId}:${g.ballots[bId].options.length}`;
+    g.ballots[bId].options.push({ id: optId, text, label: (label || text).slice(0, 60) });
+    g.votes[bId] = g.votes[bId] || {};
+  });
+}
+
+// Post a ballot message (one numbered button per option) to a channel.
+async function postBallot(channelId, title, ballot, footer) {
+  const rows = [];
+  let row = new ActionRowBuilder();
+  ballot.options.forEach((opt, i) => {
+    if (i > 0 && i % 5 === 0) { rows.push(row); row = new ActionRowBuilder(); }
+    row.addComponents(new ButtonBuilder().setCustomId(`vote:${opt.id}`).setLabel(`${i + 1}`).setStyle(ButtonStyle.Primary));
+  });
+  rows.push(row);
+  const list = ballot.options.map((o, i) => `**${i + 1}.** ${o.label}`).join("\n");
+  return send(channelId, { embeds: [embed(title, `${list}\n\n${footer}`, 0x6d5aed)], components: rows.slice(0, 5) });
+}
+
+async function openVoting(guildId) {
+  const game = store.getGame(guildId);
+  const endsAt = Math.floor((Date.now() + timing.votingWindowSec * 1000) / 1000);
+  const footer = `Voting closes <t:${endsAt}:R> (or when everyone is \`/ready\`).`;
+  let any = false;
+  // One action ballot per nation, posted in that nation's channel.
+  const nations = isMulti(game) ? game.factions.map((f) => f.nation) : [game.primaryNation];
+  for (const nation of nations) {
+    const ballot = Object.values(game.ballots).find((b) => b.nation === nation && b.kind === "action");
+    if (!ballot || !ballot.options.length) continue;
+    any = true;
+    await postBallot(nationChannelId(game, nation), `🗳️ ${nation} — vote on this round's move`, ballot, footer);
+  }
+  if (!any) { await send(feedChannelId(game), embed("No proposals", "Nobody proposed anything — use `/propose` first.", 0xf5a623)); return; }
+  store.updateGame(guildId, (g) => { g.phase = "VOTING"; g.phaseEndsAt = Date.now() + timing.votingWindowSec * 1000; g.readySet = []; });
+  clearTimeout(timers.get(guildId));
+  timers.set(guildId, setTimeout(() => finalize(guildId), timing.votingWindowSec * 1000));
 }
 
 // The single funnel every "voting is over" path calls (timer, all-ready, host).
@@ -108,63 +195,47 @@ async function finalize(guildId) {
   clearTimeout(timers.get(guildId));
   timers.delete(guildId);
   store.updateGame(guildId, (g) => { g.phase = "RESOLVING"; });
-  const ch = await channelFor(game);
-  await ch?.send(embed("⏳ Resolving the round…", "Tallying votes and simulating the world forward.", 0xf5a623));
+  await send(feedChannelId(game), embed("⏳ Resolving the round…", "Tallying every nation's votes and simulating the world forward.", 0xf5a623));
   let summary;
   try {
     summary = await resolveRound(guildId, oh);
   } catch (e) {
     store.updateGame(guildId, (g) => { g.phase = "COLLECTING"; });
-    await ch?.send(embed("Resolution failed", `${e.message}\nProposals are still open — try /closevote again.`, 0xd64646));
+    await send(feedChannelId(game), embed("Resolution failed", `${e.message}\nProposals are still open — try /closevote again.`, 0xd64646));
     return;
   }
-  // POSTING
   store.updateGame(guildId, (g) => { g.round += 1; g.phase = "POSTING"; });
   const events = (summary?.newEvents || []).map((e) => `• **${e.date || ""}** ${e.title}`).join("\n") || "A quiet stretch — nothing major.";
-  await ch?.send(embed(`📜 ${game.primaryNation} — ${summary?.gameDate || ""}`, events, 0x4caf50));
-  await postMap(store.getGame(guildId), summary?.mapChanged ? "The map has changed:" : undefined);
-  if (summary?.fallbackReason) await ch?.send(`⚠️ ${summary.fallbackReason}`);
-  // INTERLUDE -> next COLLECTING
+  await send(feedChannelId(game), embed(`📜 ${summary?.gameDate || ""}`, events, 0x4caf50));
+  await postMap(store.getGame(guildId), null, feedChannelId(game));
+  if (summary?.fallbackReason) await send(feedChannelId(game), `⚠️ ${summary.fallbackReason}`);
+  // Interlude: surface any decisions the jump raised (catalyst, diplomacy).
+  await surfacePendingDecisions(guildId, summary);
   store.updateGame(guildId, (g) => { g.phase = "INTERLUDE"; g.phaseEndsAt = Date.now() + timing.interludeSec * 1000; });
   setTimeout(() => startCollecting(guildId), timing.interludeSec * 1000);
 }
 
-async function startCollecting(guildId) {
-  const game = store.updateGame(guildId, (g) => { g.phase = "COLLECTING"; g.phaseEndsAt = 0; });
-  const ch = await channelFor(game);
-  await ch?.send(embed(`🗳️ Round ${game.round + 1} — propose your moves`, `Use \`/propose\` to suggest what **${game.primaryNation}** should do. The host runs \`/openvote\` when proposals are in.`, 0x6d5aed));
-}
-
-// Build/refresh the voting ballot message with one button per proposal.
-async function openVoting(guildId) {
+// After a jump, tell players what awaits: an active catalyst and any chats a human
+// nation must answer. Catalyst -> a #oh-world poll; diplomacy -> a war-room nudge.
+async function surfacePendingDecisions(guildId, summary) {
   const game = store.getGame(guildId);
-  const proposals = Object.values(game.ballots).flatMap((b) => b.options);
-  const ch = await channelFor(game);
-  if (!proposals.length) {
-    await ch?.send(embed("No proposals", "Nobody proposed anything — use `/propose` first.", 0xf5a623));
-    return;
+  try {
+    const pending = await oh("listPendingDecisions");
+    if (summary?.activeCatalyst?.choices?.length || pending?.catalyst?.choices?.length) {
+      const cat = pending?.catalyst || summary.activeCatalyst;
+      await send(feedChannelId(game), embed(`⚡ ${cat.title || "A catalyst unfolds"}`, `${cat.opening || ""}\n\nThe host can put this to a vote with \`/catalyst\`.`, 0xff9800));
+    }
+    for (const chat of pending?.chatsAwaitingReply || []) {
+      // The recipient nation (a human faction in the chat that isn't the last speaker).
+      const recipients = (chat.countries || []).map((c) => c.name).filter((n) => (game.factions || []).some((f) => f.nation === n) || n === game.primaryNation);
+      const last = chat.last?.speaker || "";
+      const recipient = recipients.find((n) => n !== last) || recipients[0];
+      if (!recipient) continue;
+      await send(nationChannelId(game, recipient), embed("💬 A message awaits a reply", `**${last}** wrote to **${recipient}**:\n> ${(chat.last?.text || "").slice(0, 300)}\n\nReply with \`/diplomacy reply target:${chat.id} message:…\`.`, 0x2196f3));
+    }
+  } catch {
+    /* pending-decisions is best-effort */
   }
-  const rows = [];
-  let row = new ActionRowBuilder();
-  proposals.forEach((opt, i) => {
-    if (i > 0 && i % 5 === 0) { rows.push(row); row = new ActionRowBuilder(); }
-    row.addComponents(new ButtonBuilder().setCustomId(`vote:${opt.id}`).setLabel(`${i + 1}`).setStyle(ButtonStyle.Primary));
-  });
-  rows.push(row);
-  const list = proposals.map((o, i) => `**${i + 1}.** ${o.text}`).join("\n");
-  const endsAt = Math.floor((Date.now() + timing.votingWindowSec * 1000) / 1000);
-  const msg = await ch?.send({
-    embeds: [embed("🗳️ Vote on this round's move", `${list}\n\nVoting closes <t:${endsAt}:R> (or when everyone is \`/ready\`).`, 0x6d5aed)],
-    components: rows.slice(0, 5),
-  });
-  store.updateGame(guildId, (g) => {
-    g.phase = "VOTING";
-    g.phaseEndsAt = Date.now() + timing.votingWindowSec * 1000;
-    g.readySet = [];
-    if (msg) g.ballotMessageId = msg.id;
-  });
-  clearTimeout(timers.get(guildId));
-  timers.set(guildId, setTimeout(() => finalize(guildId), timing.votingWindowSec * 1000));
 }
 
 // --- reconcile on boot -------------------------------------------------------
@@ -173,18 +244,12 @@ async function reconcile() {
   for (const gid of Object.keys(s.guilds)) {
     const game = s.guilds[gid];
     if (!game.active) continue;
-    // Replay any ops that a crash left un-applied (idempotent — engine ids are stable).
     const pending = store.pendingOps(gid);
     if (pending.length) {
       console.log(`[reconcile] ${gid}: replaying ${pending.length} pending op(s)`);
-      try {
-        for (const op of pending) { await oh(op.method, ...op.args); store.markOpApplied(gid, op.opId); }
-        store.clearOps(gid);
-      } catch (e) {
-        console.warn(`[reconcile] ${gid}: op replay failed — ${e.message}`);
-      }
+      try { for (const op of pending) { await oh(op.method, ...op.args); store.markOpApplied(gid, op.opId); } store.clearOps(gid); }
+      catch (e) { console.warn(`[reconcile] ${gid}: replay failed — ${e.message}`); }
     }
-    // Re-arm a past-due voting timer immediately.
     if (game.phase === "VOTING") {
       const remaining = Math.max(0, game.phaseEndsAt - Date.now());
       timers.set(gid, setTimeout(() => finalize(gid), remaining));
@@ -192,121 +257,213 @@ async function reconcile() {
   }
 }
 
-// --- interaction handling ----------------------------------------------------
+// --- interactions ------------------------------------------------------------
 client.on("interactionCreate", async (interaction) => {
   try {
-    if (interaction.isButton() && interaction.customId.startsWith("vote:")) {
-      const optionId = interaction.customId.slice(5);
-      const gid = interaction.guildId;
-      const game = store.getGame(gid);
-      if (game.phase !== "VOTING") return interaction.reply({ content: "Voting isn't open right now.", ephemeral: true });
-      // Find the ballot holding this option.
-      const ballot = Object.values(game.ballots).find((b) => b.options.some((o) => o.id === optionId));
-      if (!ballot) return interaction.reply({ content: "That option is no longer available.", ephemeral: true });
-      store.recordVote(gid, ballot.id, interaction.user.id, optionId);
-      return interaction.reply({ content: "Vote recorded (you can change it by voting again).", ephemeral: true });
-    }
+    if (interaction.isButton() && interaction.customId.startsWith("vote:")) return handleVote(interaction);
+    if (interaction.isButton() && interaction.customId.startsWith("cat:")) return handleCatalystVote(interaction);
     if (!interaction.isChatInputCommand()) return;
-    const gid = interaction.guildId;
-    const name = interaction.commandName;
-
-    if (name === "help") {
-      return interaction.reply({
-        embeds: [embed("How to play", [
-          "**/startgame nation** — host starts a game (everyone plays that nation).",
-          "**/propose** — suggest a move for the round.",
-          "**/openvote** — host opens voting on the proposals.",
-          "Tap a numbered button to vote; **/ready** to end voting early.",
-          "**/closevote** — host resolves the round now.",
-          "**/map**, **/live** — see the world; **/status** — current state.",
-        ].join("\n"))],
-        ephemeral: true,
-      });
-    }
-
-    if (name === "startgame") {
-      const nation = interaction.options.getString("nation", true);
-      await interaction.deferReply();
-      await oh("setActivePlayers", [nation]);
-      store.updateGame(gid, (g) => {
-        Object.assign(g, { active: true, round: 0, phase: "COLLECTING", primaryNation: nation, factionNations: [], channelId: interaction.channelId, players: {}, ballots: {}, votes: {}, pendingOps: [] });
-      });
-      await interaction.editReply(`🌍 New game started — everyone plays **${nation}**. Use \`/propose\` to suggest this round's moves, then the host runs \`/openvote\`.`);
-      const url = liveUrl();
-      if (url) await interaction.followUp(`🔴 Live read-only map: ${url}`);
-      return;
-    }
-
-    const game = store.getGame(gid);
-    if (["propose", "openvote", "closevote", "ready", "map", "live", "status", "endgame"].includes(name) && !game.active) {
-      return interaction.reply({ content: "No game is running here — a host can start one with `/startgame`.", ephemeral: true });
-    }
-
-    if (name === "propose") {
-      const text = interaction.options.getString("text", true);
-      if (game.phase !== "COLLECTING") return interaction.reply({ content: "Proposals are closed for this round.", ephemeral: true });
-      await interaction.deferReply({ ephemeral: true });
-      // Refine through the engine so the option text is a clean order (falls back offline).
-      let refined = text;
-      try { const entry = await oh("queueActionFor", "__preview__", text); refined = entry?.title || text; } catch { /* keep raw */ }
-      // NOTE: the preview queued an action; clear it so only the VOTED action resolves.
-      try { await oh("clearQueuedActions"); } catch { /* ignore */ }
-      const bId = makeBallotId({ round: game.round, decisionKey: "action" });
-      store.updateGame(gid, (g) => {
-        if (!g.ballots[bId]) g.ballots[bId] = { id: bId, kind: "action", decisionKey: "action", nation: g.primaryNation, options: [] };
-        const optId = `${bId}:${g.ballots[bId].options.length}`;
-        g.ballots[bId].options.push({ id: optId, text, label: refined.slice(0, 60) });
-        g.votes[bId] = g.votes[bId] || {};
-      });
-      return interaction.editReply(`Proposal added: “${refined.slice(0, 80)}”. The host opens voting with \`/openvote\`.`);
-    }
-
-    if (name === "openvote") {
-      if (game.phase !== "COLLECTING") return interaction.reply({ content: "Voting can only open during proposals.", ephemeral: true });
-      await interaction.reply("🗳️ Opening the vote…");
-      return openVoting(gid);
-    }
-
-    if (name === "closevote") {
-      if (game.phase !== "VOTING") return interaction.reply({ content: "There's no open vote to close.", ephemeral: true });
-      await interaction.reply("Closing the vote and resolving…");
-      return finalize(gid);
-    }
-
-    if (name === "ready") {
-      if (game.phase !== "VOTING") return interaction.reply({ content: "There's nothing to be ready for right now.", ephemeral: true });
-      let everyone = false;
-      store.updateGame(gid, (g) => {
-        g.readySet = Array.from(new Set([...(g.readySet || []), interaction.user.id]));
-        const voters = new Set(Object.values(g.votes).flatMap((v) => Object.keys(v)));
-        everyone = voters.size > 0 && g.readySet.length >= voters.size;
-      });
-      await interaction.reply({ content: "You're marked ready.", ephemeral: true });
-      if (everyone) await finalize(gid);
-      return;
-    }
-
-    if (name === "map") { await interaction.deferReply(); await postMap(game, "Current world:"); return interaction.editReply("🗺️ Posted above."); }
-    if (name === "live") { const u = liveUrl(); return interaction.reply(u ? `🔴 Live read-only map: ${u}` : "The tunnel isn't up yet — try again shortly."); }
-    if (name === "status") {
-      return interaction.reply({ embeds: [embed("Status", [
-        `Nation: **${game.primaryNation}**`,
-        `Round: **${game.round + 1}**`,
-        `Phase: **${game.phase}**`,
-        `Proposals this round: **${Object.values(game.ballots).flatMap((b) => b.options).length}**`,
-      ].join("\n"))] });
-    }
-    if (name === "endgame") {
-      clearTimeout(timers.get(gid));
-      store.updateGame(gid, (g) => { g.active = false; g.phase = "IDLE"; });
-      return interaction.reply("🏁 Game ended. Thanks for playing!");
-    }
+    return handleCommand(interaction);
   } catch (e) {
     console.error("interaction error:", e);
-    if (interaction.deferred || interaction.replied) interaction.editReply(`Error: ${e.message}`).catch(() => {});
-    else interaction.reply({ content: `Error: ${e.message}`, ephemeral: true }).catch(() => {});
+    const msg = `Error: ${e.message}`;
+    if (interaction.deferred || interaction.replied) interaction.editReply(msg).catch(() => {});
+    else interaction.reply({ content: msg, ephemeral: true }).catch(() => {});
   }
 });
+
+async function handleVote(interaction) {
+  const optionId = interaction.customId.slice(5);
+  const gid = interaction.guildId;
+  const game = store.getGame(gid);
+  if (game.phase !== "VOTING") return interaction.reply({ content: "Voting isn't open right now.", ephemeral: true });
+  const ballot = Object.values(game.ballots).find((b) => b.options.some((o) => o.id === optionId));
+  if (!ballot) return interaction.reply({ content: "That option is no longer available.", ephemeral: true });
+  // In a team game, only that nation's members vote on its ballot.
+  if (isMulti(game) && game.players[interaction.user.id] !== ballot.nation) {
+    return interaction.reply({ content: `Only ${ballot.nation}'s team can vote here. Use /join to pick a nation.`, ephemeral: true });
+  }
+  store.recordVote(gid, ballot.id, interaction.user.id, optionId);
+  return interaction.reply({ content: "Vote recorded (change it by voting again).", ephemeral: true });
+}
+
+async function handleCatalystVote(interaction) {
+  const gid = interaction.guildId;
+  const idx = interaction.customId.slice(4);
+  store.recordVote(gid, "catalyst", interaction.user.id, idx);
+  return interaction.reply({ content: "Catalyst vote recorded.", ephemeral: true });
+}
+
+async function handleCommand(interaction) {
+  const gid = interaction.guildId;
+  const name = interaction.commandName;
+
+  if (name === "help") {
+    return interaction.reply({ embeds: [embed("How to play", [
+      "**/startgame nations:France,Germany** — host starts a game. One nation = solo; several = teams (each gets a private war-room).",
+      "**/join nation:France** — join a team.",
+      "**/propose** / **/forces** — suggest a move or a military order for your nation.",
+      "**/openvote** (host) — open voting; tap a number to vote, **/ready** to end early.",
+      "**/closevote** (host) — resolve the round now.",
+      "**/diplomacy**, **/catalyst**, **/inspect**, **/country**, **/map**, **/live**, **/status**.",
+    ].join("\n"))], ephemeral: true });
+  }
+
+  if (name === "startgame") {
+    if (!isHost(interaction)) return interaction.reply({ content: "Only a host (Manage Server) can start a game.", ephemeral: true });
+    const nations = interaction.options.getString("nations", true).split(",").map((n) => n.trim()).filter(Boolean).slice(0, 16);
+    if (!nations.length) return interaction.reply({ content: "Name at least one nation.", ephemeral: true });
+    await interaction.deferReply();
+    await oh("setActivePlayers", nations);
+    let provisioned = { worldChannelId: "", factions: [] };
+    if (nations.length > 1) {
+      try { provisioned = await provisionFactions(interaction.guild, nations); }
+      catch (e) { return interaction.editReply(`Couldn't set up teams (the bot needs Manage Roles + Manage Channels): ${e.message}`); }
+    }
+    store.updateGame(gid, (g) => {
+      Object.assign(g, store.getGame(gid), {
+        active: true, round: 0, phase: "COLLECTING",
+        primaryNation: nations[0], factionNations: nations.slice(1),
+        channelId: interaction.channelId, worldChannelId: provisioned.worldChannelId, factions: provisioned.factions,
+        players: {}, ballots: {}, votes: {}, pendingOps: [],
+      });
+    });
+    const url = liveUrl();
+    await interaction.editReply(nations.length > 1
+      ? `🌍 New game — **${nations.join(", ")}**. Each nation has a war-room; players \`/join\` a team, then \`/propose\`.${url ? `\n🔴 Live map: ${url}` : ""}`
+      : `🌍 New game — everyone plays **${nations[0]}**. \`/propose\` this round's moves, then the host runs \`/openvote\`.${url ? `\n🔴 Live map: ${url}` : ""}`);
+    await startCollecting(gid);
+    return;
+  }
+
+  const game = store.getGame(gid);
+  if (!game.active && !["live", "help"].includes(name)) {
+    return interaction.reply({ content: "No game is running — a host can start one with `/startgame`.", ephemeral: true });
+  }
+
+  if (name === "join") {
+    const nation = interaction.options.getString("nation", true);
+    if (!isMulti(game)) return interaction.reply({ content: "This is a solo game — everyone already plays the same nation.", ephemeral: true });
+    await interaction.deferReply({ ephemeral: true });
+    try { const got = await assignNation(interaction.guild, interaction.member, nation); return interaction.editReply(`You joined **${got}**. Head to its war-room to propose and vote.`); }
+    catch (e) { return interaction.editReply(e.message); }
+  }
+  if (name === "leave") {
+    store.setPlayerNation(gid, interaction.user.id, null);
+    const roleIds = (game.factions || []).map((f) => f.roleId).filter((id) => interaction.member.roles.cache.has(id));
+    await interaction.member.roles.remove(roleIds).catch(() => {});
+    return interaction.reply({ content: "You left your nation.", ephemeral: true });
+  }
+
+  if (name === "propose" || name === "forces") {
+    if (game.phase !== "COLLECTING") return interaction.reply({ content: "Proposals are closed for this round.", ephemeral: true });
+    const nation = isMulti(game) ? nationForChannel(game, interaction.channelId) || game.players[interaction.user.id] : game.primaryNation;
+    if (!nation) return interaction.reply({ content: "Propose from your nation's war-room (or `/join` a nation first).", ephemeral: true });
+    let text = interaction.options.getString(name === "forces" ? "detail" : "text", true);
+    if (name === "forces") text = `${interaction.options.getString("order", true)} ${text}`;
+    await interaction.deferReply({ ephemeral: true });
+    let label = text;
+    try { const entry = await oh("queueActionFor", "__preview__", text); label = entry?.title || text; await oh("clearQueuedActions"); } catch { /* keep raw */ }
+    addProposal(gid, nation, text, label);
+    return interaction.editReply(`Proposal added for **${nation}**: “${label.slice(0, 80)}”.`);
+  }
+
+  if (name === "openvote") {
+    if (!isHost(interaction)) return interaction.reply({ content: "Only a host can open voting.", ephemeral: true });
+    if (game.phase !== "COLLECTING") return interaction.reply({ content: "Voting can only open during proposals.", ephemeral: true });
+    await interaction.reply("🗳️ Opening the vote…");
+    return openVoting(gid);
+  }
+  if (name === "closevote") {
+    if (!isHost(interaction)) return interaction.reply({ content: "Only a host can close the vote.", ephemeral: true });
+    if (game.phase !== "VOTING") return interaction.reply({ content: "There's no open vote to close.", ephemeral: true });
+    await interaction.reply("Closing the vote and resolving…");
+    return finalize(gid);
+  }
+  if (name === "ready") {
+    if (game.phase !== "VOTING") return interaction.reply({ content: "There's nothing to be ready for right now.", ephemeral: true });
+    let everyone = false;
+    store.updateGame(gid, (g) => {
+      g.readySet = Array.from(new Set([...(g.readySet || []), interaction.user.id]));
+      const voters = new Set(Object.values(g.votes).flatMap((v) => Object.keys(v)));
+      everyone = voters.size > 0 && g.readySet.length >= voters.size;
+    });
+    await interaction.reply({ content: "You're marked ready.", ephemeral: true });
+    if (everyone) await finalize(gid);
+    return;
+  }
+
+  if (name === "catalyst") {
+    if (!isHost(interaction)) return interaction.reply({ content: "Only a host can call a catalyst vote.", ephemeral: true });
+    await interaction.deferReply();
+    const pending = await oh("listPendingDecisions");
+    const cat = pending?.catalyst;
+    if (!cat?.choices?.length) return interaction.editReply("No active catalyst to vote on.");
+    store.updateGame(gid, (g) => { g.catalystChoices = cat.choices; g.votes = { ...g.votes, catalyst: {} }; });
+    const rows = [new ActionRowBuilder()];
+    cat.choices.slice(0, 5).forEach((c, i) => rows[0].addComponents(new ButtonBuilder().setCustomId(`cat:${i}`).setLabel(`${i + 1}`).setStyle(ButtonStyle.Secondary)));
+    const list = cat.choices.map((c, i) => `**${i + 1}.** ${c}`).join("\n");
+    await interaction.editReply({ embeds: [embed(`⚡ ${cat.title || "Catalyst"}`, `${cat.opening || ""}\n\n${list}\n\nVote, then the host runs \`/catalyst\` again to resolve.`, 0xff9800)], components: rows });
+    // Second /catalyst resolves if a vote already exists.
+    if (Object.keys(game.votes?.catalyst || {}).length) {
+      const votes = game.votes.catalyst;
+      const counts = {};
+      for (const v of Object.values(votes)) counts[v] = (counts[v] || 0) + 1;
+      const bestIdx = Object.entries(counts).sort((a, b) => b[1] - a[1])[0]?.[0];
+      if (bestIdx != null) { const choiceText = cat.choices[Number(bestIdx)]; const r = await oh("advanceCatalyst", choiceText); await send(feedChannelId(game), embed("⚡ Catalyst resolved", r?.resolved ? (r.newEvents || []).map((e) => `• ${e.title}`).join("\n") || "The scene resolves." : "The scene continues…", 0xff9800)); }
+    }
+    return;
+  }
+
+  if (name === "diplomacy") {
+    const action = interaction.options.getString("action", true);
+    if (action === "list") {
+      const pending = await oh("listPendingDecisions");
+      const lines = (pending?.chatsAwaitingReply || []).map((c) => `• \`${c.id}\` ${c.countries?.map((x) => x.name).join(" ↔ ")}: “${(c.last?.text || "").slice(0, 60)}”`).join("\n") || "No open conversations awaiting a reply.";
+      return interaction.reply({ embeds: [embed("💬 Diplomacy", lines)], ephemeral: true });
+    }
+    const nation = isMulti(game) ? game.players[interaction.user.id] : game.primaryNation;
+    if (!nation) return interaction.reply({ content: "Join a nation first (`/join`).", ephemeral: true });
+    const message = interaction.options.getString("message");
+    if (action === "reply") {
+      const chatId = interaction.options.getString("target");
+      if (!chatId || !message) return interaction.reply({ content: "Usage: /diplomacy reply target:<chat id> message:<text>", ephemeral: true });
+      await interaction.deferReply();
+      const r = await oh("postChatReply", chatId, message);
+      return interaction.editReply(`Reply sent as **${nation}**. ${r?.messages?.length ? `The other side answered.` : ""}`);
+    }
+    if (action === "open") {
+      const target = interaction.options.getString("target");
+      if (!target || !message) return interaction.reply({ content: "Usage: /diplomacy open target:<nation> message:<text>", ephemeral: true });
+      await interaction.deferReply();
+      await oh("queueActionFor", nation, `Open diplomatic talks with ${target}: ${message}`);
+      return interaction.editReply(`Queued an outreach to **${target}** — it resolves on the next jump.`);
+    }
+  }
+
+  if (name === "inspect") {
+    await interaction.deferReply();
+    const r = await oh("inspectRegion", { name: interaction.options.getString("region", true) });
+    return interaction.editReply(r?.regionId ? `**${r.name || interaction.options.getString("region")}** — owner: ${r.owner || "unclaimed"}${r.loadedOnMap ? "" : " (not in the current view)"}` : "No such region found.");
+  }
+  if (name === "country") {
+    await interaction.deferReply();
+    try { const sheet = await oh("countryStatSheet", { name: interaction.options.getString("name", true) }); return interaction.editReply({ embeds: [embed(`📊 ${interaction.options.getString("name")}`, "```json\n" + JSON.stringify(sheet, null, 2).slice(0, 3500) + "\n```")] }); }
+    catch (e) { return interaction.editReply(`Couldn't fetch that: ${e.message}`); }
+  }
+  if (name === "map") { await interaction.deferReply(); await postMap(game, interaction.options.getString("focus"), interaction.channelId); return interaction.editReply("🗺️ Posted above."); }
+  if (name === "live") { const u = liveUrl(); return interaction.reply(u ? `🔴 Live read-only map: ${u}` : "The tunnel isn't up yet — try again shortly."); }
+  if (name === "status") {
+    const nations = isMulti(game) ? game.factions.map((f) => f.nation).join(", ") : game.primaryNation;
+    return interaction.reply({ embeds: [embed("Status", [`Nations: **${nations}**`, `Round: **${game.round + 1}**`, `Phase: **${game.phase}**`, `Proposals: **${Object.values(game.ballots).flatMap((b) => b.options).length}**`].join("\n"))] });
+  }
+  if (name === "endgame") {
+    if (!isHost(interaction)) return interaction.reply({ content: "Only a host can end the game.", ephemeral: true });
+    clearTimeout(timers.get(gid));
+    store.updateGame(gid, (g) => { g.active = false; g.phase = "IDLE"; });
+    return interaction.reply("🏁 Game ended. Thanks for playing!");
+  }
+}
 
 client.once("ready", async () => {
   console.log(`Discord bot logged in as ${client.user.tag}`);
@@ -315,5 +472,5 @@ client.once("ready", async () => {
   await reconcile();
 });
 
-await registerCommands().catch(() => {}); // ensure commands exist even before first ready
+await registerCommands().catch(() => {});
 await client.login(token);

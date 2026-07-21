@@ -23,7 +23,10 @@ const freshGame = (guildId) => ({
   phaseEndsAt: 0,
   primaryNation: "",
   factionNations: [], // extra human nations (multi-nation games)
-  channelId: "", // #world (shared read-only feed + ballots)
+  channelId: "", // fallback single-channel (M2) — #world used when factions exist
+  worldChannelId: "", // shared read-only #oh-world (multi-nation)
+  factions: [], // [{ nation, roleId, channelId (war-room) }]
+  pendingDecisions: [], // diplomacy/catalyst polls opened this interlude
   players: {}, // userId -> nation
   ballots: {}, // ballotId -> { id, kind, decisionKey, options[], messageId, channelId, tallyClosed }
   votes: {}, // ballotId -> { userId -> optionId }
