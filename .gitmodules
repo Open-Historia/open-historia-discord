@@ -1,0 +1,4 @@
+[submodule "game"]
+	path = game
+	url = https://github.com/Open-Historia/open-historia-discord-game.git
+	branch = discord-edition
