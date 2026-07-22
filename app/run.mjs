@@ -154,6 +154,18 @@ if (!existsSync(GAME_ENTRY)) {
   process.exit(1);
 }
 
+// The world-map vector tiles (~200 MB: country/region/city polygons) are NOT in
+// git — they're GitHub Release assets the game fetches at launch. We start
+// server.js directly (bypassing the game's own launcher), so ensure them here or
+// the map shows only the satellite basemap with no countries. Best-effort and
+// bounded: fetch-map-assets.mjs never exits non-zero, so it can't block startup.
+const regionsTiles = path.join(GAME_DIR, "public", "assets", "regions.pmtiles");
+const fetchScript = path.join(GAME_DIR, "scripts", "fetch-map-assets.mjs");
+if (!existsSync(regionsTiles) && existsSync(fetchScript)) {
+  console.log("World map tiles missing — downloading them (~200 MB, one time)…");
+  spawnSync(process.execPath, [fetchScript, "--ensure"], { cwd: GAME_DIR, stdio: "inherit" });
+}
+
 const children = [
   { name: "game", file: GAME_ENTRY, cwd: GAME_DIR, env: { PORT: String(GAME_PORT), HOST: "127.0.0.1" } },
   { name: "proxy", file: path.join(__dirname, "spectator-proxy.mjs"), env: { GAME_PORT: String(GAME_PORT), SPECTATOR_PORT: String(SPECTATOR_PORT) } },

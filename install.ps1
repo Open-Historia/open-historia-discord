@@ -95,6 +95,15 @@ if (-not $gameDir) {
 }
 Write-Host "Game: $gameDir" -ForegroundColor Green
 
+# The world-map vector tiles (~200 MB: country/region/city polygons) ship as
+# GitHub Release assets, not in git. Without them the map is only the satellite
+# basemap. Fetch them now (idempotent — skips files already present).
+$fetchScript = Join-Path $gameDir "scripts\fetch-map-assets.mjs"
+if ((Test-Path $fetchScript) -and -not (Test-Path (Join-Path $gameDir "public\assets\regions.pmtiles"))) {
+  Write-Host "Downloading world-map tiles (~200 MB, one time)..." -ForegroundColor Cyan
+  Push-Location $gameDir; node scripts\fetch-map-assets.mjs --ensure; Pop-Location
+}
+
 # ---- 4. Discord bot ----
 Section "4/6  Discord bot"
 Write-Host "Create an app + bot at https://discord.com/developers/applications,"

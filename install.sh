@@ -57,6 +57,13 @@ if [ -z "$GAME_DIR" ]; then
 fi
 echo "Game: $GAME_DIR"
 
+# World-map vector tiles (~200 MB) ship as GitHub Release assets, not in git.
+# Without them the map is only the satellite basemap. Fetch them now (idempotent).
+if [ -f "$GAME_DIR/scripts/fetch-map-assets.mjs" ] && [ ! -f "$GAME_DIR/public/assets/regions.pmtiles" ]; then
+  echo "Downloading world-map tiles (~200 MB, one time)..."
+  ( cd "$GAME_DIR" && node scripts/fetch-map-assets.mjs --ensure )
+fi
+
 section "4/6  Discord bot"
 D_TOKEN="$(asksecret "Discord bot token" "$(cfg discord.token)")"
 D_CLIENT="$(ask "Application (client) id" "$(cfg discord.clientId)")"
