@@ -43,8 +43,8 @@ const guildId = CONFIG.discord?.guildId;
 const commands = [
   new SlashCommandBuilder().setName("startgame").setDescription("Host: start a game")
     .addStringOption((o) => o.setName("nations").setDescription("Comma-separated nations (one = solo, many = teams)").setRequired(true)),
-  new SlashCommandBuilder().setName("join").setDescription("Join a nation's team")
-    .addStringOption((o) => o.setName("nation").setDescription("Which nation to play").setRequired(true)),
+  new SlashCommandBuilder().setName("join").setDescription("Join the game (so the round waits for you)")
+    .addStringOption((o) => o.setName("nation").setDescription("Which nation to play (team games only)").setRequired(false)),
   new SlashCommandBuilder().setName("leave").setDescription("Leave your current nation"),
   new SlashCommandBuilder().setName("propose").setDescription("Propose an action for your nation this round")
     .addStringOption((o) => o.setName("text").setDescription("What should your nation do?").setRequired(true)),
@@ -124,7 +124,7 @@ async function send(channelId, payload) {
 
 async function postMap(game, focus, channelId) {
   try {
-    const opts = focus ? { region: focus, zoom: 4 } : { country: game.primaryNation, zoom: 4 };
+    const opts = focus ? { region: focus, zoom: 4 } : { world: true };
     const { png } = await oh("screenshotMap", opts);
     const file = new AttachmentBuilder(Buffer.from(png, "base64"), { name: "map.png" });
     await send(channelId || feedChannelId(game), { files: [file] });
@@ -143,7 +143,7 @@ async function startCollecting(guildId) {
     }
     await send(game.worldChannelId, embed(`🗳️ Round ${round} — proposals open`, "Each nation is planning in its war-room.", 0x6d5aed));
   } else {
-    await send(game.channelId, embed(`🗳️ Round ${round} — propose your moves`, `Use \`/propose\` (or \`/forces\`), then the host runs \`/openvote\`.`, 0x6d5aed));
+    await send(game.channelId, embed(`🗳️ Round ${round} — propose your moves`, `\`/join\` to play (or just \`/propose\` / \`/forces\` — that joins you too). The host runs \`/openvote\` when ready; the round waits for everyone who joined to \`/ready\`.`, 0x6d5aed));
   }
 }
 
@@ -282,12 +282,15 @@ async function handleVote(interaction) {
   if (game.phase !== "VOTING") return interaction.reply({ content: "Voting isn't open right now.", ephemeral: true });
   const ballot = Object.values(game.ballots).find((b) => b.options.some((o) => o.id === optionId));
   if (!ballot) return interaction.reply({ content: "That option is no longer available.", ephemeral: true });
-  // In a team game, only that nation's members vote on its ballot.
-  if (isMulti(game) && game.players[interaction.user.id] !== ballot.nation) {
-    return interaction.reply({ content: `Only ${ballot.nation}'s team can vote here. Use /join to pick a nation.`, ephemeral: true });
+  const current = game.players[interaction.user.id];
+  // In a team game you can only vote on your own nation's ballot.
+  if (isMulti(game) && current && current !== ballot.nation) {
+    return interaction.reply({ content: `You're on ${current}'s team — you can only vote on ${current}'s moves.`, ephemeral: true });
   }
+  // Voting counts as joining: whoever votes is a participant the round waits on.
+  if (!current) store.setPlayerNation(gid, interaction.user.id, ballot.nation || game.primaryNation);
   store.recordVote(gid, ballot.id, interaction.user.id, optionId);
-  return interaction.reply({ content: "Vote recorded (change it by voting again).", ephemeral: true });
+  return interaction.reply({ content: "Vote recorded — you're in this game now (change it by voting again).", ephemeral: true });
 }
 
 async function handleCatalystVote(interaction) {
@@ -304,11 +307,11 @@ async function handleCommand(interaction) {
   if (name === "help") {
     return interaction.reply({ embeds: [embed("How to play", [
       "**/startgame nations:France,Germany** — host starts a game. One nation = solo; several = teams (each gets a private war-room).",
-      "**/join nation:France** — join a team.",
-      "**/propose** / **/forces** — suggest a move or a military order for your nation.",
-      "**/openvote** (host) — open voting; tap a number to vote, **/ready** to end early.",
+      "**/join** — join the game (add `nation:France` in a team game). Proposing or voting joins you automatically.",
+      "**/propose** / **/forces** — suggest a move or a military order.",
+      "**/openvote** (host) — open voting; tap a number to vote. **/ready** — the round resolves once every joined player is ready (or the timer runs out).",
       "**/closevote** (host) — resolve the round now.",
-      "**/diplomacy**, **/catalyst**, **/inspect**, **/country**, **/map**, **/live**, **/status**.",
+      "**/diplomacy**, **/catalyst**, **/inspect**, **/country**, **/map** (whole world; `focus:France` to zoom), **/live**, **/status**.",
     ].join("\n"))], ephemeral: true });
   }
 
@@ -345,9 +348,15 @@ async function handleCommand(interaction) {
   }
 
   if (name === "join") {
-    const nation = interaction.options.getString("nation", true);
-    if (!isMulti(game)) return interaction.reply({ content: "This is a solo game — everyone already plays the same nation.", ephemeral: true });
     await interaction.deferReply({ ephemeral: true });
+    if (!isMulti(game)) {
+      // Solo game: join the shared nation so the round counts you and waits for
+      // your /ready. No role needed.
+      store.setPlayerNation(gid, interaction.user.id, game.primaryNation);
+      return interaction.editReply(`You joined the game as **${game.primaryNation}**. \`/propose\` moves, vote, then \`/ready\`.`);
+    }
+    const nation = interaction.options.getString("nation");
+    if (!nation) return interaction.editReply("This is a team game — pick a nation, e.g. `/join nation:France`.");
     try { const got = await assignNation(interaction.guild, interaction.member, nation); return interaction.editReply(`You joined **${got}**. Head to its war-room to propose and vote.`); }
     catch (e) { return interaction.editReply(e.message); }
   }
@@ -365,6 +374,7 @@ async function handleCommand(interaction) {
     let text = interaction.options.getString(name === "forces" ? "detail" : "text", true);
     if (name === "forces") text = `${interaction.options.getString("order", true)} ${text}`;
     await interaction.deferReply({ ephemeral: true });
+    store.setPlayerNation(gid, interaction.user.id, nation); // proposing joins you in
     let label = text;
     try { const entry = await oh("queueActionFor", "__preview__", text); label = entry?.title || text; await oh("clearQueuedActions"); } catch { /* keep raw */ }
     addProposal(gid, nation, text, label);
@@ -387,11 +397,16 @@ async function handleCommand(interaction) {
     if (game.phase !== "VOTING") return interaction.reply({ content: "There's nothing to be ready for right now.", ephemeral: true });
     let everyone = false;
     store.updateGame(gid, (g) => {
+      if (!g.players[interaction.user.id]) g.players[interaction.user.id] = g.primaryNation; // readying joins you
       g.readySet = Array.from(new Set([...(g.readySet || []), interaction.user.id]));
-      const voters = new Set(Object.values(g.votes).flatMap((v) => Object.keys(v)));
-      everyone = voters.size > 0 && g.readySet.length >= voters.size;
+      // The round waits for the PARTICIPANTS (everyone who joined / proposed /
+      // voted / readied) — not every random voter, and not people who never
+      // touched the game. Timer is still the backstop.
+      const participants = Object.keys(g.players);
+      everyone = participants.length > 0 && participants.every((id) => g.readySet.includes(id));
     });
-    await interaction.reply({ content: "You're marked ready.", ephemeral: true });
+    const g2 = store.getGame(gid);
+    await interaction.reply({ content: `You're ready (${g2.readySet.length}/${Object.keys(g2.players).length} players).`, ephemeral: true });
     if (everyone) await finalize(gid);
     return;
   }
