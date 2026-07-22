@@ -26,6 +26,27 @@ Write-Host "  Open Historia - Discord edition setup" -ForegroundColor Cyan
 Write-Host "  Host a vote-driven game on your own server." -ForegroundColor Cyan
 Write-Host "==============================================" -ForegroundColor Cyan
 
+# ---- Autofill from an existing config (re-runs never make you re-enter) ----
+# Load the saved discord.config.json if present; every prompt then offers the
+# saved value as its default, so pressing Enter keeps it. (PowerShell returns
+# $null for a missing nested property, so these reads are safe when $existing is null.)
+$existing = $null
+$cfgFile = Join-Path $PSScriptRoot "discord.config.json"
+if (Test-Path $cfgFile) {
+  try { $existing = ((Get-Content $cfgFile -Raw) -replace "^\xEF\xBB\xBF", "") | ConvertFrom-Json } catch { $existing = $null }
+  if ($existing) { Write-Host "Found your saved discord.config.json - press Enter at any prompt to keep the saved value." -ForegroundColor Green }
+}
+function Ask($label, $default) {
+  $shown = if ($default) { "$label [$default]" } else { $label }
+  $v = Read-Host $shown
+  if ([string]::IsNullOrWhiteSpace($v)) { return $default } else { return $v }
+}
+function AskSecret($label, $current) {
+  $shown = if ($current) { "$label [saved - Enter to keep]" } else { $label }
+  $v = Read-Host $shown
+  if ([string]::IsNullOrWhiteSpace($v)) { return $current } else { return $v }
+}
+
 # ---- 1. Prerequisites ----
 Section "1/6  Checking prerequisites (Node.js, git)"
 if (-not (NodeOk)) { Winget-Install "OpenJS.NodeJS.LTS" "Node.js LTS" }
@@ -50,19 +71,26 @@ if (-not $installOk) { Read-Host "Dependency install failed. Press Enter to exit
 # ---- 3. The game (submodule build, or an existing path) ----
 Section "3/6  The game"
 $gameDir = ""
+# Re-run shortcut: reuse an already-built game instead of rebuilding.
+if ($existing -and $existing.gameDir -and (Test-Path (Join-Path $existing.gameDir "dist"))) {
+  $keep = Ask "Reuse the built game at $($existing.gameDir)? (y/n)" "y"
+  if ($keep -match "^[Yy]") { $gameDir = $existing.gameDir; Write-Host "Reusing existing build." -ForegroundColor Green }
+}
 $sub = Join-Path $PSScriptRoot "game"
-if (Test-Path (Join-Path $sub "server\server.js")) {
-  Write-Host "Found the bundled game submodule; building it..." -ForegroundColor Cyan
-  Push-Location $sub; git submodule update --init --recursive 2>$null; npm ci; npm run build; Pop-Location
-  $gameDir = (Resolve-Path $sub).Path
-} else {
-  $mode = Read-Host "Game: (1) clone & build the discord-edition fork  (2) use an existing built path [1]"
-  if ($mode -eq "2") {
-    $gameDir = Read-Host "Path to a built game (folder containing server\ and dist\)"
+if (-not $gameDir) {
+  if (Test-Path (Join-Path $sub "server\server.js")) {
+    Write-Host "Found the bundled game submodule; building it..." -ForegroundColor Cyan
+    Push-Location $sub; git submodule update --init --recursive 2>$null; npm ci; npm run build; Pop-Location
+    $gameDir = (Resolve-Path $sub).Path
   } else {
-    git clone -b discord-edition https://github.com/Open-Historia/open-historia-discord-game game
-    Push-Location game; npm ci; npm run build; Pop-Location
-    $gameDir = (Resolve-Path game).Path
+    $mode = Read-Host "Game: (1) clone & build the discord-edition fork  (2) use an existing built path [1]"
+    if ($mode -eq "2") {
+      $gameDir = Read-Host "Path to a built game (folder containing server\ and dist\)"
+    } else {
+      git clone -b discord-edition https://github.com/Open-Historia/open-historia-discord-game game
+      Push-Location game; npm ci; npm run build; Pop-Location
+      $gameDir = (Resolve-Path game).Path
+    }
   }
 }
 Write-Host "Game: $gameDir" -ForegroundColor Green
@@ -70,30 +98,38 @@ Write-Host "Game: $gameDir" -ForegroundColor Green
 # ---- 4. Discord bot ----
 Section "4/6  Discord bot"
 Write-Host "Create an app + bot at https://discord.com/developers/applications,"
-Write-Host "enable no privileged intents (this edition needs none), and invite it to your server."
-$dToken  = Read-Host "Discord bot token"
-$dClient = Read-Host "Application (client) id"
-$dGuild  = Read-Host "Server (guild) id"
-$dChannel = Read-Host "Channel id for game posts (optional, Enter to skip)"
+Write-Host "enable no privileged intents (this edition needs none), invite it with Manage Roles"
+Write-Host "+ Manage Channels, then paste its ids below."
+$dToken  = AskSecret "Discord bot token" $existing.discord.token
+$dClient = Ask "Application (client) id" $existing.discord.clientId
+$dGuild  = Ask "Server (guild) id" $existing.discord.guildId
+$dChannel = Ask "Channel id for game posts (optional)" $existing.discord.channelId
 
 # ---- 5. AI provider (drives the game's simulation) ----
 Section "5/6  AI provider"
 $providers = @("gemini","openai","anthropic","openai-compatible","anthropic-compatible")
+$defAi = if ($existing) { $existing.ai.provider } else { "" }
 for ($i=0; $i -lt $providers.Count; $i++) { Write-Host ("  {0}) {1}" -f ($i+1), $providers[$i]) }
-do { $p = Read-Host "Choose 1-$($providers.Count)"; $pn = 0; $okp = [int]::TryParse($p,[ref]$pn) -and $pn -ge 1 -and $pn -le $providers.Count } while (-not $okp)
-$ai = $providers[$pn-1]
-$aiKey = Read-Host "AI API key"
-$aiModel = Read-Host "Model (Enter for the provider default)"
+$ai = ""
+$prompt5 = if ($defAi) { "Choose 1-$($providers.Count) [keep $defAi]" } else { "Choose 1-$($providers.Count)" }
+do {
+  $p = Read-Host $prompt5
+  if ([string]::IsNullOrWhiteSpace($p) -and $defAi) { $ai = $defAi }
+  else { $pn = 0; if ([int]::TryParse($p,[ref]$pn) -and $pn -ge 1 -and $pn -le $providers.Count) { $ai = $providers[$pn-1] } }
+} while (-not $ai)
+$aiKey = AskSecret "AI API key" $existing.ai.apiKey
+$aiModel = Ask "Model (Enter for the provider default)" $existing.ai.model
 $aiEndpoint = ""
-if ($ai -like "*-compatible") { $aiEndpoint = Read-Host "Endpoint URL" }
+if ($ai -like "*-compatible") { $aiEndpoint = Ask "Endpoint URL" $existing.ai.endpoint }
 
 # ---- 6. Ports + tunnel (the read-only live map) ----
 Section "6/6  Ports + Cloudflare Tunnel"
-$gamePort = Read-Host "Game port (loopback only) [3000]"; if ([string]::IsNullOrWhiteSpace($gamePort)) { $gamePort = "3000" }
-$spectatorPort = Read-Host "Public spectator port [8080]"; if ([string]::IsNullOrWhiteSpace($spectatorPort)) { $spectatorPort = "8080" }
-$bridgePort = Read-Host "Bridge RPC port (loopback only) [8090]"; if ([string]::IsNullOrWhiteSpace($bridgePort)) { $bridgePort = "8090" }
+$gamePort = Ask "Game port (loopback only)" $(if ($existing.gamePort) { $existing.gamePort } else { "3000" })
+$spectatorPort = Ask "Public spectator port" $(if ($existing.spectatorPort) { $existing.spectatorPort } else { "8080" })
+$bridgePort = Ask "Bridge RPC port (loopback only)" $(if ($existing.bridgePort) { $existing.bridgePort } else { "8090" })
 $tunnelMode = "none"; $tunnelName = ""; $publicUrl = ""
-$useTunnel = Read-Host "Set up a Cloudflare Tunnel for the live map now? [Y/n]"
+$defTunnelYN = if ($existing -and $existing.tunnel -eq "none") { "n" } else { "Y" }
+$useTunnel = Ask "Set up a Cloudflare Tunnel for the live map now? [Y/n]" $defTunnelYN
 if ($useTunnel -notmatch "^[Nn]") {
   $cf = Join-Path $PSScriptRoot "app\cloudflared.exe"
   if (-not (Test-Path $cf)) {

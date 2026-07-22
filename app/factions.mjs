@@ -12,7 +12,9 @@ const slug = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(
 // Create #oh-world (everyone can read, only the bot posts) + one role + private
 // war-room per nation. Idempotent-ish: reuses a same-named role/channel if found.
 export async function provisionFactions(guild, nations) {
-  const me = guild.members.me;
+  // The bot's own id — from the client user, so we don't depend on the member
+  // cache (which needs the privileged Server Members intent we deliberately omit).
+  const meId = guild.client.user.id;
   const everyone = guild.roles.everyone;
   const factions = [];
 
@@ -25,7 +27,7 @@ export async function provisionFactions(guild, nations) {
       topic: "Open Historia — world events + live map (read-only)",
       permissionOverwrites: [
         { id: everyone.id, deny: [PermissionFlagsBits.SendMessages], allow: [PermissionFlagsBits.ViewChannel] },
-        { id: me.id, allow: [PermissionFlagsBits.SendMessages, PermissionFlagsBits.ViewChannel, PermissionFlagsBits.AttachFiles] },
+        { id: meId, allow: [PermissionFlagsBits.SendMessages, PermissionFlagsBits.ViewChannel, PermissionFlagsBits.AttachFiles] },
       ],
     });
   }
@@ -43,7 +45,7 @@ export async function provisionFactions(guild, nations) {
         permissionOverwrites: [
           { id: everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
           { id: role.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] },
-          { id: me.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.AttachFiles] },
+          { id: meId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.AttachFiles] },
         ],
       });
     }

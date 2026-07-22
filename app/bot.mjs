@@ -97,7 +97,10 @@ if (REGISTER_ONLY) {
   process.exit(0);
 }
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
+// Only the (non-privileged) Guilds intent. Slash-command interactions carry the
+// acting member in their payload, and role add/remove is a REST call gated by the
+// Manage Roles permission — so no privileged Server Members intent is needed.
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 const timers = new Map(); // guildId -> voting timeout
 
 function embed(title, description, color = 0x6d5aed) {

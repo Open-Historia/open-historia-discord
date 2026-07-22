@@ -24,7 +24,9 @@ The design guarantees that **only the bot's own headless browser can write to th
 
 The installer collects your Discord bot token, AI provider + key, and a tunnel choice; installs Node dependencies + a headless Chromium; builds the game; writes `discord.config.json` (BOM-free, gitignored); and registers the slash commands.
 
-Before running it: create a bot at the [Discord developer portal](https://discord.com/developers/applications), copy its **token**, **application (client) id**, and your **server (guild) id**, and invite the bot to your server. No privileged intents are required.
+Before running it: create a bot at the [Discord developer portal](https://discord.com/developers/applications), copy its **token**, **application (client) id**, and your **server (guild) id**, and invite the bot to your server with the **Manage Roles** and **Manage Channels** permissions (so it can create the per-nation war-rooms in team games). **No privileged intents are required** — slash commands carry the acting member, and roles are assigned via a permission-gated REST call.
+
+Re-running the installer never makes you re-type anything: it reads your existing `discord.config.json` and offers each saved value as the default (press Enter to keep it).
 
 Then start it any time with `start.bat` / `./start.sh`.
 
