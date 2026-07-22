@@ -343,7 +343,9 @@ async function handleCommand(interaction) {
   }
 
   const game = store.getGame(gid);
-  if (!game.active && !["live", "help"].includes(name)) {
+  // /endgame must work even when the game is already inactive — that's exactly
+  // when war-rooms get orphaned and need tearing down. /leave is harmless too.
+  if (!game.active && !["live", "help", "endgame", "leave"].includes(name)) {
     return interaction.reply({ content: "No game is running — a host can start one with `/startgame`.", ephemeral: true });
   }
 
@@ -494,6 +496,23 @@ async function handleCommand(interaction) {
       try { const role = await interaction.guild.roles.fetch(f.roleId); if (role) { await role.delete("Open Historia game ended"); removedRoles += 1; } }
       catch { /* already deleted — fine */ }
     }
+    // Fallback sweep by the bot's own naming, so a game whose records were lost
+    // (a crash, an old build, a reset) still cleans up fully. #oh-world, every
+    // "<nation>-war-room", and every "OH <nation>" role.
+    try {
+      const channels = await interaction.guild.channels.fetch();
+      for (const ch of channels.values()) {
+        if (ch && (ch.name === "oh-world" || ch.name.endsWith("-war-room"))) {
+          try { await ch.delete("Open Historia cleanup"); removedChannels += 1; } catch { /* ignore */ }
+        }
+      }
+      const roles = await interaction.guild.roles.fetch();
+      for (const role of roles.values()) {
+        if (role && role.name.startsWith("OH ")) {
+          try { await role.delete("Open Historia cleanup"); removedRoles += 1; } catch { /* ignore */ }
+        }
+      }
+    } catch { /* best-effort sweep */ }
     store.resetGame(gid);
     try {
       await interaction.editReply(`🏁 Game ended. Removed ${removedChannels} war-room/world channel(s)${removedRoles ? ` and ${removedRoles} faction role(s)` : ""}. Thanks for playing!`);
