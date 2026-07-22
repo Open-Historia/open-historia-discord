@@ -477,9 +477,28 @@ async function handleCommand(interaction) {
   }
   if (name === "endgame") {
     if (!isHost(interaction)) return interaction.reply({ content: "Only a host can end the game.", ephemeral: true });
+    await interaction.deferReply({ ephemeral: true });
     clearTimeout(timers.get(gid));
-    store.updateGame(gid, (g) => { g.active = false; g.phase = "IDLE"; });
-    return interaction.reply("🏁 Game ended. Thanks for playing!");
+    const ending = store.getGame(gid);
+    // Tear down everything this game created: the per-nation war-rooms, #oh-world,
+    // and the faction roles. Deleting the channel the command ran in is fine — the
+    // reply goes back through the interaction token, not that channel.
+    let removedChannels = 0;
+    const channelIds = [...(ending.factions || []).map((f) => f.channelId), ending.worldChannelId].filter(Boolean);
+    for (const id of channelIds) {
+      try { const ch = await client.channels.fetch(id); if (ch) { await ch.delete("Open Historia game ended"); removedChannels += 1; } }
+      catch { /* already deleted — fine */ }
+    }
+    let removedRoles = 0;
+    for (const f of ending.factions || []) {
+      try { const role = await interaction.guild.roles.fetch(f.roleId); if (role) { await role.delete("Open Historia game ended"); removedRoles += 1; } }
+      catch { /* already deleted — fine */ }
+    }
+    store.resetGame(gid);
+    try {
+      await interaction.editReply(`🏁 Game ended. Removed ${removedChannels} war-room/world channel(s)${removedRoles ? ` and ${removedRoles} faction role(s)` : ""}. Thanks for playing!`);
+    } catch { /* the channel we replied in was one of the deleted ones */ }
+    return;
   }
 }
 
