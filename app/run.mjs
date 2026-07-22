@@ -6,7 +6,7 @@
 //   3. bot bridge        headless Playwright Chromium -> game/?bot=1, loopback RPC
 //   4. discord bot       discord.js -> voting -> bridge RPC -> posts map + events
 //   5. cloudflared       --url the SPECTATOR proxy (never the game port)
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync, unlinkSync, mkdirSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
@@ -32,18 +32,33 @@ const cfBin = path.join(__dirname, process.platform === "win32" ? "cloudflared.e
 let stopping = false;
 let tunnel = null;
 let stoppingTunnel = false;
-
-const cleanup = () => {
-  stopping = true;
-  stoppingTunnel = true;
+// Every live child, so shutdown takes them ALL down — not just the tunnel.
+// Leaving the game/proxy/bridge alive on Ctrl-C is what caused EADDRINUSE on the
+// next launch (their ports stayed held). On Windows a plain kill leaves a child's
+// own children (e.g. the bridge's Chromium) orphaned, so tree-kill via taskkill.
+const activeChildren = new Set();
+const killProc = (proc) => {
+  if (!proc || proc.killed) return;
   try {
-    tunnel?.kill();
+    if (process.platform === "win32" && proc.pid) {
+      spawnSync("taskkill", ["/pid", String(proc.pid), "/T", "/F"], { stdio: "ignore" });
+    } else {
+      proc.kill();
+    }
   } catch {
     /* already gone */
   }
 };
+
+const cleanup = () => {
+  stopping = true;
+  stoppingTunnel = true;
+  killProc(tunnel);
+  for (const proc of activeChildren) killProc(proc);
+  activeChildren.clear();
+};
 process.on("exit", cleanup);
-for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => { cleanup(); process.exit(0); });
+for (const sig of ["SIGINT", "SIGTERM", "SIGBREAK"]) process.on(sig, () => { cleanup(); process.exit(0); });
 
 // --- wait for the game's loopback port before starting proxy/bridge ----------
 const waitForPort = (port, host = "127.0.0.1", timeoutMs = 120000) =>
@@ -114,8 +129,9 @@ async function superviseOne(child) {
         cwd: child.cwd || __dirname,
         env: { ...process.env, ...child.env },
       });
-      proc.on("exit", (c) => resolve(c ?? 0));
-      proc.on("error", (e) => { console.error(`[${child.name}] failed to spawn: ${e.message}`); resolve(1); });
+      activeChildren.add(proc);
+      proc.on("exit", (c) => { activeChildren.delete(proc); resolve(c ?? 0); });
+      proc.on("error", (e) => { activeChildren.delete(proc); console.error(`[${child.name}] failed to spawn: ${e.message}`); resolve(1); });
     });
     if (stopping || code === 0) return;
     const ran = Date.now() - startedAt;

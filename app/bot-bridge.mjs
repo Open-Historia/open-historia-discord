@@ -106,7 +106,7 @@ const call = async (method, args = []) => {
 
 // Loopback-only JSON-RPC. Binding 127.0.0.1 means only the same-machine bot
 // process can drive the writer — the RPC is never exposed to the tunnel.
-http
+const rpcServer = http
   .createServer((req, res) => {
     if (req.method === "GET" && (req.url === "/health" || req.url === "/")) {
       res.writeHead(ready ? 200 : 503, { "content-type": "application/json" });
@@ -129,8 +129,15 @@ http
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify(out));
     });
-  })
-  .listen(RPC, "127.0.0.1", () => console.log(`bot-bridge RPC :${RPC} (loopback)`));
+  });
+rpcServer.on("error", (e) => {
+  if (e.code === "EADDRINUSE") {
+    console.error(`bot-bridge: port ${RPC} is already in use — another instance is probably still running. Stop it first, or set bridgePort in discord.config.json.`);
+    process.exit(1);
+  }
+  throw e;
+});
+rpcServer.listen(RPC, "127.0.0.1", () => console.log(`bot-bridge RPC :${RPC} (loopback)`));
 
 for (const sig of ["SIGINT", "SIGTERM"]) {
   process.on(sig, async () => {

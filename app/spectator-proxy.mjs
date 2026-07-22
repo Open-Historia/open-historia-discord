@@ -65,6 +65,13 @@ const server = http.createServer((req, res) => {
   req.pipe(upstream);
 });
 
+server.on("error", (e) => {
+  if (e.code === "EADDRINUSE") {
+    console.error(`spectator proxy: port ${PORT} is already in use — another instance is probably still running. Stop it first (close the old window / Task Manager), or set spectatorPort in discord.config.json.`);
+    process.exit(1);
+  }
+  throw e;
+});
 // Bind all interfaces: this port is what the tunnel (and, if the operator opts
 // for direct exposure, the LAN) reaches. Only safe methods ever get through.
 server.listen(PORT, "0.0.0.0", () => {
